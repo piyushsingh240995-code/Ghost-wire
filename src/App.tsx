@@ -1,0 +1,570 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { useState, useEffect, useRef } from 'react';
+import { auth, db, logout, handleFirestoreError, OperationType, signInWithGoogle } from './lib/firebase';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import { doc, getDoc, setDoc, onSnapshot, updateDoc, serverTimestamp, collection, query, where, getDocs, writeBatch, deleteDoc } from 'firebase/firestore';
+import { MessageSquare, User, Ghost, LogOut, ShieldAlert, Lock } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { cn } from './lib/utils';
+import { generateIdentityKeys, unwrapPrivateKey } from './lib/crypto';
+import { getTheme } from './lib/themes';
+import ChatListView from './components/ChatListView';
+import ChatView from './components/ChatView';
+import ProfileView from './components/ProfileView';
+
+export default function App() {
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [profile, setProfile] = useState<any>(null);
+  const currentTheme = getTheme(profile?.theme || localStorage.getItem('ghostchat_theme') || 'ghostwire');
+  const [privateKey, setPrivateKey] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [initError, setInitError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<'chats' | 'profile'>('chats');
+  const [selectedChat, setSelectedChat] = useState<string | null>(null);
+  const [totalUnread, setTotalUnread] = useState(0);
+  const [authLoading, setAuthLoading] = useState(false);
+  const prevUnreadCounts = useRef<Record<string, number>>({});
+  const isFirstLoad = useRef(true);
+
+  useEffect(() => {
+    // Request notification permission
+    if (Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      if (!u) {
+        setLoading(false);
+        setInitError(null);
+        setProfile(null);
+        setPrivateKey(null);
+        isFirstLoad.current = true;
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    let unsubProfile: (() => void) | null = null;
+    let unsubConvList: (() => void) | null = null;
+
+    const userRef = doc(db, 'users', user.uid);
+    const privateKeyRef = doc(db, 'private_keys', user.uid);
+
+    async function syncProfile() {
+      console.log("Protocol Handshake Initialized...");
+      setInitError(null);
+      setLoading(true);
+
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error("HANDSHAKE_TIMEOUT: Signal unstable. Check connection.")), 30000)
+      );
+
+      try {
+        await Promise.race([
+          (async () => {
+            let snap, pvSnap;
+            try {
+              [snap, pvSnap] = await Promise.all([
+                getDoc(userRef),
+                getDoc(privateKeyRef)
+              ]);
+            } catch (err: any) {
+              if (err.message.includes("resource-exhausted") || err.code === "resource-exhausted") {
+                throw new Error("QUOTA_EXHAUSTED: Signal limit reached.");
+              }
+              throw err;
+            }
+            
+            let currentProfile: any = null;
+
+            if (!snap.exists()) {
+              console.log("New Entity Detected. Generating Identity Keys...");
+              let keys;
+              try {
+                keys = await generateIdentityKeys(user!.uid);
+              } catch (keyErr: any) {
+                console.error("Key generation failed:", keyErr);
+                throw new Error(`KEY_GENERATION_FAILED: ${keyErr?.message || keyErr}`);
+              }
+
+              // Sanitize username: only lowercase alphanumeric and single underscores, max 25 chars
+              const rawName = user!.displayName || user!.email?.split('@')[0] || 'ghost';
+              const cleanBase = rawName
+                .toLowerCase()
+                .replace(/[^a-z0-9]/g, '_')
+                .replace(/_+/g, '_')
+                .replace(/^_+|_+$/g, '') || 'ghost';
+              const generatedUsername = `${cleanBase.slice(0, 18)}_${Math.floor(1000 + Math.random() * 9000)}`;
+              const cleanDisplayName = (user!.displayName || user!.email?.split('@')[0] || 'Anon Ghost').trim().slice(0, 50);
+              const isUserAdmin = user!.email === 'piyushsingh240995@gmail.com';
+              
+              currentProfile = {
+                uid: user!.uid,
+                username: generatedUsername,
+                displayName: cleanDisplayName,
+                email: user!.email || '',
+                photoURL: user!.photoURL || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(user!.uid)}`,
+                ghostMode: false,
+                soundEnabled: true,
+                autoPurge: false,
+                blockedUsers: [],
+                publicKey: keys.publicKey,
+                isAdmin: isUserAdmin,
+                isBanned: false,
+                theme: 'ghostwire',
+                lastSeen: serverTimestamp()
+              };
+
+              let rawPrivateKey: string;
+              try {
+                rawPrivateKey = await unwrapPrivateKey(keys.wrappedPrivateKey, keys.vaultIv, user!.uid);
+              } catch (unwErr: any) {
+                console.error("Key unwrapping failed:", unwErr);
+                throw new Error(`VAULT_UNWRAP_FAILED: ${unwErr?.message || unwErr}`);
+              }
+
+              try {
+                await setDoc(userRef, currentProfile);
+              } catch (dbErr: any) {
+                console.error("Profile creation failed in database:", dbErr);
+                throw new Error(`PROVISION_FAILED: ${dbErr?.message || dbErr?.code || 'Could not register user in database.'}`);
+              }
+
+              try {
+                await setDoc(privateKeyRef, { 
+                  wrappedPrivateKey: keys.wrappedPrivateKey, 
+                  vaultIv: keys.vaultIv,
+                  createdAt: serverTimestamp() 
+                });
+              } catch (vaultErr: any) {
+                console.error("Vault creation failed in database:", vaultErr);
+                throw new Error(`VAULT_SEALING_FAILED: ${vaultErr?.message || vaultErr?.code || 'Encrypted keys could not be stored.'}`);
+              }
+              
+              setProfile(currentProfile);
+              setPrivateKey(rawPrivateKey);
+              console.log("Handshake Complete (New Identity Registered)");
+            } else {
+              console.log("Existing Entity Recognized. Unwrapping Vault...");
+              currentProfile = snap.data();
+              const updates: any = {};
+              
+              const pvData = pvSnap.data();
+              if (!currentProfile.publicKey || !pvSnap.exists() || !pvData?.wrappedPrivateKey) {
+                console.log("Public Key missing or legacy vault found. Regenerating...");
+                const keys = await generateIdentityKeys(user!.uid);
+                updates.publicKey = keys.publicKey;
+                await setDoc(privateKeyRef, { 
+                  wrappedPrivateKey: keys.wrappedPrivateKey, 
+                  vaultIv: keys.vaultIv,
+                  createdAt: serverTimestamp() 
+                });
+                const rawPrivateKey = await unwrapPrivateKey(keys.wrappedPrivateKey, keys.vaultIv, user!.uid);
+                setPrivateKey(rawPrivateKey);
+              } else {
+                try {
+                  const rawPrivateKey = await unwrapPrivateKey(pvData.wrappedPrivateKey, pvData.vaultIv, user!.uid);
+                  setPrivateKey(rawPrivateKey);
+                } catch (cryptoErr) {
+                  console.error("Vault decryption failed:", cryptoErr);
+                  throw new Error("VAULT_CORRUPTION: Security keys are malformed or inaccessible. Your identity handshake failed.");
+                }
+              }
+
+              if (currentProfile.soundEnabled === undefined) updates.soundEnabled = true;
+              if (currentProfile.isBanned === undefined) updates.isBanned = false;
+              const isUserAdmin = user!.email === 'piyushsingh240995@gmail.com';
+              if (isUserAdmin && !currentProfile.isAdmin) updates.isAdmin = true;
+              if (!currentProfile.username) {
+                const rawN = currentProfile.displayName || user!.email?.split('@')[0] || 'ghost';
+                const cB = rawN.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '') || 'ghost';
+                updates.username = `${cB.slice(0, 18)}_${Math.floor(1000 + Math.random() * 9000)}`;
+              }
+
+              if (Object.keys(updates).length > 0) {
+                try {
+                  await updateDoc(userRef, updates);
+                  currentProfile = { ...currentProfile, ...updates };
+                } catch (e) {
+                  console.warn("Handshake partial update failed (Quota?):", e);
+                }
+              }
+
+              setProfile(currentProfile);
+              console.log("Handshake Complete (Established Identity)");
+            }
+
+            // START LISTENERS AFTER PROFILE IS SYNCED
+            unsubProfile = onSnapshot(userRef, async (s) => {
+              const data = s.data();
+              if (data?.isBanned) {
+                await auth.signOut();
+                alert("BY THE WILL OF THE ARCHITECT, YOUR SIGNAL HAS BEEN PERMANENTLY INCINERATED.");
+              }
+              if (data) setProfile(data);
+            }, (err) => {
+              console.warn("Profile snapshot warning:", err);
+            });
+
+            const qConv = query(
+              collection(db, 'conversations'),
+              where('participants', 'array-contains', user!.uid)
+            );
+            
+            unsubConvList = onSnapshot(qConv, (snap) => {
+              let total = 0;
+              const newCounts: Record<string, number> = {};
+              snap.docs.forEach(doc => {
+                const data = doc.data();
+                const count = data.unreadCount?.[user!.uid] || 0;
+                total += count;
+                newCounts[doc.id] = count;
+                if (!isFirstLoad.current && count > (prevUnreadCounts.current[doc.id] || 0)) {
+                  if (Notification.permission === 'granted' && (document.hidden || selectedChat !== doc.id)) {
+                    new Notification(`New Signal Detected`, {
+                      body: data.lastMessage || 'Information received.',
+                      icon: '/ghost.png'
+                    });
+                  }
+                }
+              });
+              setTotalUnread(total);
+              prevUnreadCounts.current = newCounts;
+              isFirstLoad.current = false;
+            }, (err) => {
+              console.warn("Conversations listener warning:", err);
+            });
+
+          })(),
+          timeoutPromise
+        ]);
+      } catch (error: any) {
+        console.error("CRITICAL PROTOCOL ERROR:", error);
+        let message = error?.message || "HANDSHAKE_TIMEOUT: Signal unstable.";
+        if (message.includes("resource-exhausted") || message.includes("Quota limit exceeded")) {
+          message = "QUOTA_EXHAUSTED: Daily signal limit reached. Protocol will resume after daily reset.";
+        }
+        setInitError(message);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    syncProfile();
+
+    return () => {
+      unsubProfile?.();
+      unsubConvList?.();
+      isFirstLoad.current = true;
+    };
+  }, [user?.uid]);
+
+
+  // Activity tracking removed to save quota
+  useEffect(() => {
+    if (!user || !profile || profile.ghostMode) return;
+    // We only update lastSeen on initial handshake to save quota
+  }, [user?.uid, profile?.ghostMode]);
+
+  const resetProtocol = async () => {
+    if (!user || !window.confirm("CRITICAL: Resetting encryption protocol will make your previous encrypted messages unreadable. Proceed?")) return;
+    
+    setLoading(true);
+    setInitError(null);
+    try {
+      const userRef = doc(db, 'users', user.uid);
+      const privateKeyRef = doc(db, 'private_keys', user.uid);
+      
+      // Wipe old keys and clear profile public key to force re-generation
+      await Promise.all([
+        deleteDoc(privateKeyRef),
+        updateDoc(userRef, { publicKey: null })
+      ]);
+      
+      // Reload page to re-trigger syncProfile
+      window.location.reload();
+    } catch (e) {
+      console.error("Reset failed:", e);
+      setInitError("RESET_FAILED: COULD NOT PURGE KEYS");
+      setLoading(false);
+    }
+  };
+
+  if (initError && user) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen bg-[#0a0a0a] text-white p-6">
+        <motion.div
+          initial={{ scale: 0.9, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          className="text-center space-y-6 max-w-md border border-red-500/20 bg-red-500/5 p-8 rounded-3xl"
+        >
+          <div className="flex justify-center">
+            {initError.includes("QUOTA_EXHAUSTED") ? (
+              <Lock className="w-16 h-16 text-amber-500" />
+            ) : (
+              <ShieldAlert className="w-16 h-16 text-red-500" />
+            )}
+          </div>
+          <h2 className={cn(
+            "text-2xl font-bold tracking-tight uppercase",
+            initError.includes("QUOTA_EXHAUSTED") ? "text-amber-500" : "text-red-500"
+          )}>
+            {initError.includes("QUOTA_EXHAUSTED") ? "Bandwidth Exhausted" : "Signal Intervention"}
+          </h2>
+          <div className="space-y-2">
+            <p className="text-zinc-400 text-sm">
+              {initError.includes("QUOTA_EXHAUSTED") 
+                ? "The transmission frequency has exceeded the daily free limit for this project."
+                : "Your identity vault has been compromised or corrupted."}
+            </p>
+            <code className="block p-2 bg-black rounded text-[10px] text-zinc-500 overflow-x-auto">
+              {initError}
+            </code>
+          </div>
+          <div className="flex flex-col gap-3">
+            {initError.includes("QUOTA_EXHAUSTED") ? (
+              <p className="text-[10px] text-zinc-600 italic">Quota resets daily. Please check back later or upgrade your Firebase plan.</p>
+            ) : (
+              <>
+                <button
+                  onClick={() => window.location.reload()}
+                  className="w-full py-3 bg-white text-black font-semibold rounded-xl hover:bg-zinc-200 transition-colors"
+                >
+                  Retry Handshake
+                </button>
+                <button
+                  onClick={resetProtocol}
+                  className="w-full py-3 bg-red-500/10 text-red-400 font-semibold rounded-xl hover:bg-red-500/20 transition-colors border border-red-500/20"
+                >
+                  Purge Keys & Reset Protocol
+                </button>
+              </>
+            )}
+            <button
+              onClick={logout}
+              className="text-zinc-600 text-xs hover:text-zinc-400 underline"
+            >
+              Sign Out
+            </button>
+          </div>
+        </motion.div>
+      </div>
+    );
+  }
+
+  if (loading || (user && !profile)) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen bg-[#0a0a0a] text-white">
+        <motion.div
+          animate={{ scale: [1, 1.2, 1], opacity: [0.5, 1, 0.5] }}
+          transition={{ duration: 2, repeat: Infinity }}
+          className="mb-4"
+        >
+          <Ghost className="w-12 h-12 text-zinc-500" />
+        </motion.div>
+        <motion.div 
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: 1 }}
+          className="text-center"
+        >
+          <div className="text-[10px] font-black uppercase tracking-[0.4em] text-zinc-700 animate-pulse">Establishing Signal</div>
+        </motion.div>
+      </div>
+    );
+  }
+
+  const updateIdentityPassword = async () => {
+    // Hidden feature for now since we're using Google only UI
+    alert("PASSWORD_STRICT: Signal managed by external provider.");
+  };
+
+  if (!user) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen bg-[#0a0a0a] text-white p-6">
+        <motion.div
+          initial={{ y: 20, opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          className="text-center space-y-6 max-w-md"
+        >
+          <div className="flex justify-center">
+            <div className="relative">
+              <Ghost className="w-20 h-20 text-zinc-200" />
+              <motion.div
+                animate={{ opacity: [0, 1, 0] }}
+                transition={{ duration: 3, repeat: Infinity }}
+                className="absolute inset-0 bg-zinc-200 blur-2xl opacity-20"
+              />
+            </div>
+          </div>
+          <h1 className="text-4xl font-bold tracking-tighter italic">GHOST CHAT</h1>
+          <p className="text-zinc-500 text-sm tracking-widest uppercase font-black">Untraceable. Invisible. Savage.</p>
+          
+          <button
+            disabled={loading || authLoading}
+            onClick={async () => {
+              setLoading(true);
+              setInitError(null);
+              try {
+                await signInWithGoogle();
+              } catch (e: any) {
+                console.error("Initiating signal switch failure:", e);
+                setLoading(false);
+                if (e.code === 'auth/popup-blocked') {
+                  setInitError("SIGNAL_BLOCKED: Handshake intercepted. Please enable popups.");
+                } else if (e.code === 'auth/network-request-failed') {
+                  setInitError("SIGNAL_LOST: Network connection failed.");
+                } else if (e.code === 'auth/popup-closed-by-user') {
+                  setInitError("SIGNAL_ABORTED: Handshake terminated by user.");
+                } else if (e.code === 'auth/operation-not-allowed') {
+                  setInitError("PROTOCOL_DISABLED: Google Login is NOT enabled in your Firebase Console.");
+                } else {
+                  setInitError("HANDSHAKE_ERROR: Protocol connection failed. Check your Firebase console settings.");
+                }
+              }
+            }}
+            className="w-full py-4 bg-white text-black font-black rounded-2xl hover:bg-zinc-200 transition-colors flex items-center justify-center gap-2 disabled:opacity-50 uppercase tracking-tighter cursor-pointer"
+          >
+            {(loading || authLoading) ? "ESTABLISHING SIGNAL..." : "Enter the Void"}
+          </button>
+
+          {initError && !initError.includes("QUOTA") && (
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="text-red-500 text-[10px] uppercase font-bold tracking-widest text-center space-y-2 w-full mt-4 bg-red-950/20 border border-red-900/30 p-4 rounded-xl"
+            >
+              <div>{initError}</div>
+              {(initError.includes("HANDSHAKE_ERROR") || initError.includes("REDIRECT_HANDSHAKE_FAILED") || initError.includes("PROTOCOL_DISABLED")) && (
+                <div className="text-zinc-400 font-sans tracking-normal normal-case text-left space-y-2 mt-2 text-xs">
+                  <p className="font-bold text-red-400">💡 Why did this happen?</p>
+                  <p>1. **Domain Whitelist**: Your container domain isn't authorized. Go to **Firebase Console ➔ Authentication ➔ Settings ➔ Authorized Domains** and add this hostname:</p>
+                  <code className="block bg-zinc-950 p-2 rounded text-[11px] font-mono select-all text-emerald-400 break-all">{window.location.hostname}</code>
+                  <p className="mt-2 text-zinc-500">2. **Google Cloud Console**: Whitelist this host in your **Google Client ID Authorized Redirect URIs** if configuring custom credentials.</p>
+                  <p className="mt-2 font-semibold text-zinc-300">⚡ Instant Workaround:</p>
+                  <p>Browser security settings (like cookie blocking) restrict redirects in iframes. Please click the **"Enter the Void"** button above: it launches a secured popup window which is 100% stable in this sandbox.</p>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </motion.div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={cn("flex flex-col h-screen overflow-hidden max-w-md mx-auto border-x shadow-2xl relative transition-all duration-300", currentTheme.bgMain, currentTheme.textMain, currentTheme.border)}>
+      {/* Header */}
+      <header className={cn("p-4 border-b flex justify-between items-center backdrop-blur-xl z-10 transition-all duration-300 bg-zinc-950/70 border-white/10 shadow-[0_4px_20px_rgba(0,0,0,0.4)]", currentTheme.bgHeader)}>
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center backdrop-blur-md shadow-inner">
+            <Ghost className={cn("w-4 h-4 transition-colors duration-300", profile?.ghostMode ? currentTheme.ghostAccent : "text-zinc-400")} />
+          </div>
+          <div>
+            <h1 className="text-base font-black tracking-tight flex items-center gap-2">
+              GhostChat
+              {profile?.ghostMode && (
+                <span className="text-[9px] bg-blue-500/15 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded-full font-mono font-bold tracking-wider">
+                  GHOST
+                </span>
+              )}
+            </h1>
+          </div>
+        </div>
+        <button onClick={() => setSelectedChat(null)} className="md:hidden opacity-0">Back</button>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 overflow-hidden relative">
+        <AnimatePresence mode="wait">
+          {selectedChat ? (
+            <ChatView 
+              key="chat-view"
+              conversationId={selectedChat} 
+              onBack={() => setSelectedChat(null)} 
+              userProfile={profile}
+              privateKey={privateKey}
+            />
+          ) : (
+            <motion.div
+              key={activeTab}
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="h-full"
+            >
+              {activeTab === 'chats' && <ChatListView onChatSelect={setSelectedChat} userProfile={profile} />}
+              {activeTab === 'profile' && <ProfileView profile={profile} onLogout={logout} updatePasswordFunc={updateIdentityPassword} />}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </main>
+
+      {/* Navigation */}
+      {!selectedChat && (
+        <nav className={cn("h-16 border-t flex items-center justify-around px-8 transition-all duration-300 backdrop-blur-2xl bg-zinc-950/80 border-white/10 shadow-[0_-10px_25px_rgba(0,0,0,0.5)]", currentTheme.bgNav)}>
+          <NavButton 
+            active={activeTab === 'chats'} 
+            onClick={() => setActiveTab('chats')} 
+            icon={<MessageSquare className="w-5 h-5" />} 
+            label="Chats" 
+            badge={totalUnread > 0 ? totalUnread : undefined}
+            theme={currentTheme}
+          />
+          <NavButton 
+            active={activeTab === 'profile'} 
+            onClick={() => setActiveTab('profile')} 
+            icon={<User className="w-5 h-5" />} 
+            label="Me" 
+            theme={currentTheme}
+          />
+        </nav>
+      )}
+    </div>
+  );
+}
+
+function NavButton({ active, onClick, icon, label, badge, theme }: { active: boolean, onClick: () => void, icon: any, label: string, badge?: number, theme: any }) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "flex flex-col items-center gap-1 transition-colors relative cursor-pointer",
+        active ? theme.accentText : "text-zinc-600"
+      )}
+    >
+      <div className="relative">
+        {icon}
+        {badge !== undefined && (
+          <motion.div 
+            initial={{ scale: 0 }}
+            animate={{ scale: 1 }}
+            className={cn("absolute -top-1.5 -right-1.5 text-[8px] font-black w-4 h-4 rounded-full flex items-center justify-center border-2", 
+              theme.badgeBg, theme.badgeText, theme.id === 'monochrome' ? 'border-black' : 'border-zinc-950')}
+          >
+            {badge > 9 ? '9+' : badge}
+          </motion.div>
+        )}
+      </div>
+      <span className="text-[10px] font-medium">{label}</span>
+      {active && (
+        <motion.div
+           layoutId="nav-pill"
+           className={cn("absolute -bottom-2 w-1.5 h-1.5 rounded-full",
+             theme.id === 'monochrome' ? 'bg-white' : theme.id === 'ghostwire' ? 'bg-rose-500' : theme.id === 'override' ? 'bg-red-500' : theme.id === 'spectre' ? 'bg-emerald-400' : 'bg-purple-500'
+           )}
+        />
+      )}
+    </button>
+  );
+}
+

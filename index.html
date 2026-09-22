@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GhostWire</title>
+    <meta name="description" content="A high-privacy mobile chat app with Ghost Mode, ephemeral conversations, and end-to-end encrypted signals." />
+    <meta property="og:title" content="GhostWire" />
+    <meta property="og:description" content="A high-privacy mobile chat app with Ghost Mode, ephemeral conversations, and end-to-end encrypted signals." />
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#09090b" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      if ('serviceWorker' in navigator) {
+        const isLocalhost = Boolean(
+          window.location.hostname === 'localhost' ||
+          window.location.hostname === '[::1]' ||
+          window.location.hostname.match(/^127(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}$/) ||
+          window.location.hostname.startsWith('192.168.') ||
+          window.location.hostname.startsWith('10.') ||
+          window.location.hostname.startsWith('172.')
+        );
+
+        if (!isLocalhost) {
+          window.addEventListener('load', () => {
+            navigator.serviceWorker.register('/service-worker.js')
+              .then(reg => console.log('Service Worker registered', reg))
+              .catch(err => console.log('Service Worker registration failed', err));
+          });
+        } else {
+          // Prevent white screens by actively pruning/unregistering any local service workers
+          navigator.serviceWorker.getRegistrations().then(registrations => {
+            for (let registration of registrations) {
+              registration.unregister();
+              console.log('Unregistered active local service worker to prevent cached white screens.');
+            }
+          });
+        }
+      }
+    </script>
+  </body>
+</html>
+
